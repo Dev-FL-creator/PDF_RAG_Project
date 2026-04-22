@@ -556,10 +556,10 @@ def query_pdf(body: QueryBody):
     
     k = max(1, body.top_k)
     payload = {
-        "search": body.query or "",
-        "queryType": "semantic",
+        "search": body.query or "", # Keyword Search (BM25)
+        "queryType": "semantic", # Semantic Reranking
         "semanticConfiguration": "semantic-config",
-        "vectorQueries": [{
+        "vectorQueries": [{ # Vector Search
             "kind": "vector",
             "vector": q_vec,
             "fields": VECTOR_FIELD,
