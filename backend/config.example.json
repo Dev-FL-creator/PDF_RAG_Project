@@ -1,0 +1,19 @@
+{
+    "openai_api_key": "YOUR_AZURE_OPENAI_API_KEY",
+    "openai_endpoint": "https://YOUR_RESOURCE_NAME.openai.azure.com/",
+    "openai_api_version": "2024-10-21",
+    "embedding_model": "text-embedding-ada-002",
+    "chat_model": "gpt-4o",
+    "search_service_name": "YOUR_SEARCH_SERVICE_NAME",
+    "search_api_key": "YOUR_SEARCH_API_KEY",
+    "search_api_version": "2024-07-01",
+    "docint_endpoint": "https://YOUR_DOCUMENT_INTELLIGENCE.cognitiveservices.azure.com/",
+    "docint_key": "YOUR_DOCUMENT_INTELLIGENCE_KEY",
+    "vector_metric": "cosine",
+    "openai_deployment": "gpt-4o",
+    "embedding_dimensions": 1536,
+    "enable_image_analysis": true,
+    "chunk_target_size": 800,
+    "chunk_min_size": 200,
+    "chunk_max_size": 1500
+}

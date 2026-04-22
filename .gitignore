@@ -1,0 +1,54 @@
+# Python
+backend/pdf_rag_venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Node modules
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Configuration files with sensitive data
+backend/config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Environment variables
+.env
+.env.local
+
+# Test coverage
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
