@@ -513,7 +513,7 @@ def build_index_schema(name: str, dims: int, metric: str) -> dict:
                 "name": VECTOR_FIELD,
                 "type": "Collection(Edm.Single)",
                 "searchable": True,
-                "retrievable": False,
+                "retrievable": False, # search results will not return vectors
                 "dimensions": dims,
                 "vectorSearchProfile": "pdf-vector-profile"
             },
