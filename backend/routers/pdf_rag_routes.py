@@ -246,7 +246,7 @@ def extract_pages_with_docint(
                 "order": len(page_contents[page_num])
             })
 
-    # 3) Extract key-value pairs with page tracking
+    # 3) Extract key-value pairs with page tracking，example:   Date : 2024-01-01
     for kv in (getattr(result, "key_value_pairs", None) or []):
         k = getattr(getattr(kv, "key", None), "content", None)
         v = getattr(getattr(kv, "value", None), "content", None)
@@ -476,7 +476,7 @@ def http_error(status: int, message: str):
 # AZURE SEARCH INDEX SCHEMA
 # ============================================================
 
-def build_minimal_index_schema(name: str, dims: int, metric: str) -> dict:
+def build_index_schema(name: str, dims: int, metric: str) -> dict:
     """
     Build Azure AI Search index schema for PDF RAG.
     
@@ -574,7 +574,7 @@ def ensure_index(cfg: dict, index_name: str, dims: int, metric: str):
         http_error(r.status_code, f"Index check failed: {r.text}")
 
     # Create new index
-    payload = build_minimal_index_schema(index_name, dims, metric)
+    payload = build_index_schema(index_name, dims, metric)
     print(f"[INFO] Creating new index: {index_name}")
     c = requests.post(f"{endpoint}/indexes?api-version={api_version}", headers=headers, data=json.dumps(payload))
     if c.status_code not in (200, 201):
@@ -982,7 +982,7 @@ def create_pdf_index(body: CreateIndexBody):
         raise HTTPException(status_code=500, detail=f"Check failed: {r.text}")
 
     # Create new index with specified configuration
-    payload = build_minimal_index_schema(
+    payload = build_index_schema(
         name=index_name,
         dims=int(body.vector_dimensions or DEFAULT_EMBED_DIM),
         metric=(body.metric or DEFAULT_METRIC)
