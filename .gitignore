@@ -52,3 +52,4 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+start.ps1
