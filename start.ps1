@@ -2,7 +2,7 @@
 
 param(
     [string]$ProjectPath = "C:\Users\Administrator\Desktop\Semor AI\PDF_RAG_Project",
-    [string]$NodePath = "C:\Users\Administrator\Desktop\nodejs-portable\node-v25.9.0-win-x64" 
+    [string]$NodePath = "C:\Users\Administrator\Desktop\nodejs-portable\node-v24.8.0-win-x64" 
 )
 
 Write-Host "========================================" -ForegroundColor Green
