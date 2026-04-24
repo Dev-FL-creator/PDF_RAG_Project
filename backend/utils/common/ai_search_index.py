@@ -1,7 +1,5 @@
 """
-Search Index Module
-===================
-Handles Azure AI Search index schema creation and management.
+Azure AI Search index schema creation and management.
 """
 
 import json
@@ -9,7 +7,7 @@ import requests
 from fastapi import HTTPException
 
 # Vector field name for embeddings in search index
-VECTOR_FIELD = "combined_vector"
+VECTOR_FIELD = "content_vector"
 
 
 def build_index_schema(name: str, dims: int, metric: str) -> dict:

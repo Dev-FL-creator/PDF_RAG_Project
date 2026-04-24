@@ -1,6 +1,4 @@
 """
-PDF Extractor Module
-====================
 Handles PDF text, table, image extraction using Azure Document Intelligence.
 """
 
@@ -9,7 +7,7 @@ from openai import AzureOpenAI
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.core.credentials import AzureKeyCredential
 
-from utils.image_analyzer import PDFImageAnalyzer, format_image_analysis_as_complete_text
+from utils.upload.image_analyzer import PDFImageAnalyzer, format_image_analysis_as_complete_text
 
 
 def extract_pages_with_docint(

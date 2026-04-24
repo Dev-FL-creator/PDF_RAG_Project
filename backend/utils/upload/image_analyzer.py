@@ -1,8 +1,5 @@
 """
-Image Analysis Module for PDF Image Understanding
-=================================================
-
-This module extracts and analyzes images from PDFs using:
+ extracts and analyzes images from PDFs using:
 - PyMuPDF (fitz) for image extraction
 - GPT-4o Vision for understanding image content and context
 - NOT just OCR - understands diagrams, charts, photos, etc.

@@ -1,9 +1,3 @@
-"""
-Embeddings Module
-=================
-Handles text embedding generation with caching and retry logic.
-"""
-
 import os
 import re
 import time
@@ -13,12 +7,10 @@ from hashlib import sha1
 from fastapi import HTTPException
 from openai import AzureOpenAI, RateLimitError, APIError
 
-# ============================================================
-# EMBEDDING CACHE
-# ============================================================
+
 
 # In-memory cache for embeddings to reduce API calls
-# Key: hash(model_name + text), Value: embedding vector
+# Key: hash(text-embedding-ada-002 + text), Value: embedding vector
 _EMBED_CACHE: Dict[str, List[float]] = {}
 
 
@@ -50,7 +42,7 @@ def safe_doc_id(filename: str, i: int) -> str:
         i: Chunk index
 
     Returns:
-        Safe document ID (e.g., "my_document-42")
+        Safe document ID (e.g., "my_document-1")
     """
     # Remove file extension
     name = os.path.splitext(filename)[0]

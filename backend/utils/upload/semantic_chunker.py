@@ -1,13 +1,33 @@
 """
-Semantic Chunking Module for Intelligent Text Segmentation
-==========================================================
+Chunking strategy (priority cascade):
 
-This module implements semantic-aware text chunking strategies that preserve
-meaning and context boundaries, going beyond simple character-based splitting.
+Raw text
+  │
+  ├─ Any [[TABLE]] markers?
+  │     │
+  │     ├─ Yes → extract tables → tables go through _chunk_table (row-level splitting)
+  │     │                         remaining text goes to next step
+  │     └─ No  → whole text goes to next step
+  │
+  ▼
+_chunk_regular_text
+  │
+  ├─ Split on \\n\\n into paragraphs
+  │
+  ├─ Pack paragraphs into chunks:
+  │     ├─ Paragraph < max_size 1500 and fits under target 800 → append to current chunk
+  │     ├─ Adding paragraph would exceed target 800       → close current chunk, start new one
+  │     └─ Paragraph itself > max_size                → fall back to _split_large_paragraph
+  │
+  ▼
+_split_large_paragraph (only for oversized paragraphs, >1500 chars)
+  │
+  ├─ Tokenize into sentences with NLTK
+  │     ├─ Success → pack sentences into chunks
+  │     └─ Failure → fall back to _split_by_characters (char-split with 100-char overlap)
 
 Features:
 - Sentence and paragraph boundary detection
-- Semantic similarity-based chunking
 - Table and list structure preservation
 - Metadata tracking (page numbers, chunk types)
 """
@@ -44,23 +64,20 @@ class SemanticChunker:
         target_chunk_size: int = 800,
         min_chunk_size: int = 200,
         max_chunk_size: int = 1500,
-        similarity_threshold: float = 0.75,
         enable_sentence_splitting: bool = True
     ):
         """
         Initialize semantic chunker
         
         Args:
-            target_chunk_size: Target size for chunks (characters)
-            min_chunk_size: Minimum chunk size (characters)
-            max_chunk_size: Maximum chunk size (characters)
-            similarity_threshold: Threshold for semantic similarity (0-1)
+            target_chunk_size: Target size for chunks (800 characters)
+            min_chunk_size: Minimum chunk size (200 characters)
+            max_chunk_size: Maximum chunk size (1500 characters)
             enable_sentence_splitting: Whether to split on sentence boundaries
         """
         self.target_chunk_size = target_chunk_size
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
-        self.similarity_threshold = similarity_threshold
         self.enable_sentence_splitting = enable_sentence_splitting
         
     def chunk_text(

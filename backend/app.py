@@ -9,7 +9,7 @@ from routers import pdf_rag_routes
 import requests
 import nltk
 
-# Initialize NLTK data on application startup
+# Initialize NLTK data on application startup for sentence splitting in semantic chunking. This ensures the necessary tokenizers are available without manual setup.
 def init_nltk():
     """Initialize NLTK data (auto-download on first run)"""
     required_packages = ['punkt', 'punkt_tab']
