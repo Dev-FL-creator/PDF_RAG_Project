@@ -310,5 +310,5 @@ def process_pdf_query(index_name: str, query: str, top_k: int,
         "answer": answer,
         "num_sources": len(filtered_hits),
         "min_score_threshold": MIN_RERANKER_SCORE,
-        "agent_trace": agent_trace if use_agent else ""
+        "agent_trace": agent_trace if (use_agent and not trace_id) else ""
     }
