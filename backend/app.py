@@ -91,6 +91,12 @@ def delete_index(index_name: str):
         r = requests.delete(url, headers=headers)
         
         if r.status_code in (204, 200, 202):
+            # Drop any cached schema probe so the next query re-checks the (now-deleted) index.
+            try:
+                from utils.query.pdf_query_service import invalidate_seq_support_cache
+                invalidate_seq_support_cache(index_name)
+            except Exception:
+                pass
             return {"ok": True, "message": f"Index '{index_name}' deleted"}
         else:
             return {"ok": False, "error": f"Failed to delete: {r.status_code} {r.text}"}

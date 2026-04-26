@@ -57,45 +57,72 @@ async def process_pdf_upload(file: UploadFile, index_name: str) -> dict:
         if not pages:
             http_error(400, "PDF has no extractable text")
 
-        # Step 2: split each page into semantic chunks (respecting sentence boundaries)
-        contents, meta = [], []
-        for page_no, page_text in pages:
-            target_size = cfg.get("chunk_target_size", 800)
-            min_size = cfg.get("chunk_min_size", 200)
-            max_size = cfg.get("chunk_max_size", 1500)
+        # Step 2: split each page into semantic chunks AND interleave image chunks per page so
+        # the running `seq` counter reflects true document order. Without this, all images would
+        # cluster at the end of the document and a query that hits an image would see other
+        # images as "neighbors" instead of the surrounding text on its own page.
+        target_size = cfg.get("chunk_target_size", 800)
+        min_size = cfg.get("chunk_min_size", 200)
+        max_size = cfg.get("chunk_max_size", 1500)
 
-            semantic_chunks = create_semantic_chunks(
-                text=page_text,
-                page_number=page_no,
-                target_size=target_size,
-                min_size=min_size,
-                max_size=max_size
-            )
-
-            for ci, chunk_dict in enumerate(semantic_chunks):
-                contents.append(chunk_dict["content"])
-                meta.append({
-                    "page": chunk_dict["page_number"],
-                    "chunk_id": ci,
-                    "chunk_type": chunk_dict.get("chunk_type", "text")
-                })
-
-        # Step 3: append image analysis results as standalone chunks (kept whole to preserve descriptions)
+        # Group image-analyzer results by their source page number
+        images_by_page: dict = {}
         if hasattr(extract_pages_with_docint, '_image_results'):
-            image_results = extract_pages_with_docint._image_results.get(tmp_path, [])
+            for img_idx, img_result in enumerate(extract_pages_with_docint._image_results.get(tmp_path, [])):
+                images_by_page.setdefault(img_result.page_number, []).append((img_idx, img_result))
 
-            for img_idx, img_result in enumerate(image_results):
+        # Walk all pages in document order — including pages that have ONLY images and no extracted
+        # text (those wouldn't appear in `pages` since DI returned no paragraphs/tables for them).
+        text_by_page = {p: t for p, t in pages}
+        all_page_numbers = sorted(set(text_by_page.keys()) | set(images_by_page.keys()))
+
+        contents, meta = [], []
+        seq = 0
+        total_images_added = 0
+
+        for page_no in all_page_numbers:
+            page_text = text_by_page.get(page_no)
+            if page_text:
+                semantic_chunks = create_semantic_chunks(
+                    text=page_text,
+                    page_number=page_no,
+                    target_size=target_size,
+                    min_size=min_size,
+                    max_size=max_size
+                )
+                for ci, chunk_dict in enumerate(semantic_chunks):
+                    contents.append(chunk_dict["content"])
+                    meta.append({
+                        "page": chunk_dict["page_number"],
+                        "chunk_id": ci,
+                        "chunk_type": chunk_dict.get("chunk_type", "text"),
+                        "seq": seq
+                    })
+                    seq += 1
+
+            for img_idx, img_result in images_by_page.get(page_no, []):
+                # Skip stub chunks emitted by analyze_image() when GPT-4o vision fails.
+                # They contribute nothing useful to retrieval and would otherwise occupy
+                # an embedding slot + index row that could rank for unrelated queries.
+                desc = (img_result.description or "").lstrip()
+                if desc.startswith("[Image analysis failed"):
+                    print(f"[INFO] Skipping failed image analysis on page {img_result.page_number} (no chunk indexed)")
+                    continue
+
                 image_text = format_image_analysis_as_complete_text(img_result)
                 contents.append(image_text)
                 meta.append({
                     "page": img_result.page_number,
                     "chunk_id": len(contents) - 1,
                     "chunk_type": "image",
-                    "image_index": img_idx
+                    "image_index": img_idx,
+                    "seq": seq
                 })
+                seq += 1
+                total_images_added += 1
 
-            print(f"[INFO] Added {len(image_results)} image chunks")
-
+        if total_images_added:
+            print(f"[INFO] Added {total_images_added} image chunks (interleaved by page)")
         print(f"[INFO] Extracted {len(contents)} total chunks from {file.filename}")
 
         # Step 4: generate an embedding vector for every chunk
@@ -124,6 +151,7 @@ async def process_pdf_upload(file: UploadFile, index_name: str) -> dict:
                     "page": meta[i]["page"],
                     "chunk_id": meta[i]["chunk_id"],
                     "chunk_type": meta[i]["chunk_type"],
+                    "seq": meta[i]["seq"],
                     VECTOR_FIELD: vectors[i]
                 })
             payload = {"value": docs}
@@ -179,5 +207,13 @@ def create_or_recreate_index(index_name: str, vector_dimensions: int, metric: st
 
     if c.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=f"Create failed: {c.text}")
+
+    # Schema may have changed (e.g. `seq` field added/removed); drop any cached probe so the
+    # very next query re-reads the live schema instead of a stale answer.
+    try:
+        from utils.query.pdf_query_service import invalidate_seq_support_cache
+        invalidate_seq_support_cache(index_name)
+    except Exception:
+        pass
 
     return {"ok": True, "status": "created", "index_name": index_name}

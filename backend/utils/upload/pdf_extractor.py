@@ -7,7 +7,11 @@ from openai import AzureOpenAI
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.core.credentials import AzureKeyCredential
 
-from utils.upload.image_analyzer import PDFImageAnalyzer, format_image_analysis_as_complete_text
+from utils.upload.image_analyzer import (
+    PDFImageAnalyzer,
+    format_image_analysis_as_complete_text,
+    find_captions_with_positions,
+)
 
 
 def extract_pages_with_docint(
@@ -136,29 +140,52 @@ def extract_pages_with_docint(
             "order": len(page_contents[page_num])
         })
 
-    # 4) Analyze images if enabled
+    # 4) Analyze images if enabled.
+    # Pipeline:
+    #   (a) detect every `Figure N – …` / `Table N – …` caption in the PDF (with y-position),
+    #   (b) analyze raster images and inject the position-matched caption into the vision prompt,
+    #   (c) for pages that have a caption but no raster image (vector-drawn figures), render the
+    #       whole page and analyze it the same way.
     image_results = []
     if enable_image_analysis and aoai:
         try:
             print("[INFO] Analyzing images in PDF...")
 
-            # Initialize GPT-4o vision analyzer
             analyzer = PDFImageAnalyzer(
                 openai_client=aoai,
                 deployment_name="gpt-4o",
-                min_image_size=100  # Skip images smaller than 100x100 pixels
+                min_image_size=100,
             )
 
-            # Get document context for better image understanding
-            doc_context = ""
-            if hasattr(result, "content"):
-                doc_context = result.content[:500]  # First 500 chars as context
+            # Build a per-page text map so we can pass page-specific surrounding text to the
+            # vision prompt instead of the same first-500-chars-of-the-doc for every image.
+            page_text_map = {}
+            for pn, items in page_contents.items():
+                page_text_map[pn] = "\n\n".join(item["content"] for item in items)
 
-            # Analyze all images in the PDF
-            image_results = analyzer.analyze_all_images(pdf_path, context=doc_context)
-            print(f"[INFO] Analyzed {len(image_results)} images")
+            # Detect captions once, share them across raster + vector analysis.
+            captions = find_captions_with_positions(pdf_path)
+            print(f"[INFO] Detected {len(captions)} 'Figure N – …' / 'Table N – …' captions")
 
-            # Store image results separately - they will become standalone chunks
+            raster_results = analyzer.analyze_all_images(
+                pdf_path,
+                page_text_map=page_text_map,
+                captions=captions,
+            )
+            raster_pages = {r.page_number for r in raster_results}
+
+            vector_results = analyzer.analyze_vector_figures(
+                pdf_path,
+                raster_pages=raster_pages,
+                captions=captions,
+                page_text_map=page_text_map,
+                starting_index=len(raster_results),
+            )
+
+            image_results = raster_results + vector_results
+            print(f"[INFO] Analyzed {len(raster_results)} raster image(s) + {len(vector_results)} vector figure page(s)")
+
+            # Hand off to the upload service via a function attribute (existing convention).
             if not hasattr(extract_pages_with_docint, '_image_results'):
                 extract_pages_with_docint._image_results = {}
             extract_pages_with_docint._image_results[pdf_path] = image_results

@@ -42,6 +42,8 @@ def build_index_schema(name: str, dims: int, metric: str) -> dict:
             {"name": "chunk_id", "type": "Edm.Int32", "searchable": False, "retrievable": True},
             # Type of chunk: "text", "image", "table", etc.
             {"name": "chunk_type", "type": "Edm.String", "searchable": False, "retrievable": True, "filterable": True},
+            # Global per-document chunk sequence (used at retrieval time to fetch neighboring chunks for tables)
+            {"name": "seq", "type": "Edm.Int32", "searchable": False, "retrievable": True, "filterable": True, "sortable": True},
             # Vector embedding field for semantic search
             {
                 "name": VECTOR_FIELD,
