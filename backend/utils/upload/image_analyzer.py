@@ -495,12 +495,18 @@ class PDFImageAnalyzer:
         starting_index: int = 0,
     ) -> List[ImageAnalysisResult]:
         """
-        For pages that have a `Figure N – …` caption AND no raster image was extracted from
-        them AND their previous page has no raster image either (so the figure isn't already
-        captured), render the page to PNG and run vision on it.
+        For pages that have a `Figure N – …` / `Diagram N – …` caption AND no raster image was
+        extracted from them AND their previous page has no raster image either (so the figure
+        isn't already captured), render the page to PNG and run vision on it.
+
+        Tables are intentionally skipped here: Azure Document Intelligence already extracts
+        `[[TABLE …]]` chunks (chunk_type=table, source_type=original_text) with the real cell
+        data, so re-describing them with vision would duplicate content and waste API calls.
         """
         captions_by_page: Dict[int, List[CaptionInfo]] = {}
         for c in captions:
+            if c.figure_id.lower().startswith("table"):
+                continue
             captions_by_page.setdefault(c.page_number, []).append(c)
 
         results: List[ImageAnalysisResult] = []

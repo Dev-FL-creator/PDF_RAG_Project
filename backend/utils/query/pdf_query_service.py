@@ -174,6 +174,39 @@ def _is_expandable(h: Dict) -> bool:
     return False
 
 
+# Fetch a contiguous run of chunks by `seq` from a single source document. Used by the agent's
+# `fetch_section` tool for section traversal — the agent finds a section heading via search, then
+# walks forward by seq until it sees the next heading, regardless of how poorly BM25/vector ranks
+# the middle chunks of the section.
+def _fetch_by_seq(search_url: str, headers: dict, source: str, start_seq: int,
+                  direction: str = "next", window: int = 12) -> List[Dict]:
+    if start_seq is None:
+        return []
+    src_escaped = (source or "").replace("'", "''")
+    if direction == "prev":
+        lo, hi = max(0, start_seq - window), start_seq
+    elif direction == "both":
+        lo, hi = max(0, start_seq - window), start_seq + window
+    else:  # "next" (default)
+        lo, hi = start_seq, start_seq + window
+
+    payload = {
+        "search": "*",
+        "queryType": "simple",
+        "filter": f"source eq '{src_escaped}' and seq ge {lo} and seq le {hi}",
+        "select": "content,source,page,chunk_id,chunk_type,seq",
+        "orderby": "seq asc",
+        "top": (hi - lo) + 5,
+    }
+    r = requests.post(search_url, headers=headers, data=json.dumps(payload))
+    if r.status_code != 200:
+        print(f"[WARN] _fetch_by_seq failed (source={source!r}, seq={start_seq}, {direction}): {r.text[:200]}")
+        return []
+    chunks = r.json().get("value", [])
+    chunks.sort(key=lambda x: x.get("seq") if x.get("seq") is not None else 0)
+    return chunks
+
+
 def _expand_neighbors(hits: List[Dict], search_url: str, headers: dict,
                       window: int = NEIGHBOR_WINDOW) -> List[Dict]:
     if not hits:
@@ -263,11 +296,14 @@ def _format_contexts(hits: List[Dict]) -> tuple:
         prefix = f"{type_indicator}[{src} p.{page} #{cid}] " if src and page != "" else ""
         display_contexts.append(prefix + c)
 
+        source_type = _source_type_of(ctype)
+
         if is_context:
             llm_blocks.append(
                 f"[EXCERPT {idx} — CONTEXT BLOCK]\n"
                 f"SOURCE_DOCUMENT: {src}\n"
                 f"PAGE_NUMBER: {page}\n"
+                f"SOURCE_TYPE: {source_type}\n"
                 f"NOTE: Adjacent chunk included to provide surrounding context for a nearby table, image, or figure-referencing excerpt.\n"
                 f"CONTENT:\n{c}"
             )
@@ -276,6 +312,7 @@ def _format_contexts(hits: List[Dict]) -> tuple:
                 f"[EXCERPT {idx}]\n"
                 f"SOURCE_DOCUMENT: {src}\n"
                 f"PAGE_NUMBER: {page}\n"
+                f"SOURCE_TYPE: {source_type}\n"
                 f"RELEVANCE_SCORE: {score:.2f}\n"
                 f"CONTENT:\n{c}"
             )
@@ -283,7 +320,104 @@ def _format_contexts(hits: List[Dict]) -> tuple:
     return display_contexts, llm_blocks
 
 
-# Build the standard-mode prompt: grounding rules, required citation format, quoted-passage section
+# Distinguish chunks that are extracted *from* the PDF (paragraph / table / KV — original text)
+# from chunks that are AI-generated *descriptions* of figures (image-analyzer output — not in
+# the PDF verbatim). We label both in the LLM prompt and use this to filter what the user sees
+# in the Retrieved panel: only original-text quotes are shown, never generated descriptions.
+def _source_type_of(chunk_type: str) -> str:
+    return "generated_description" if chunk_type == "image" else "original_text"
+
+
+# Whitespace-normalize for verbatim-quote verification: collapse all whitespace runs to a single
+# space and lowercase, so "the quick   brown\nfox" matches "the quick brown fox" exactly when
+# substring-tested. Tolerant of PDF newline noise but does NOT allow paraphrase.
+def _normalize_ws(s: str) -> str:
+    return re.sub(r'\s+', ' ', s or '').strip().lower()
+
+
+def _verify_quote(quote: str, src: str, page, hits: List[Dict]) -> Optional[str]:
+    """If the quote appears verbatim (whitespace-normalized, case-insensitive) inside the
+    `content` of some retrieved hit whose source AND page match what the LLM claimed,
+    return that hit's `chunk_type` (so the caller can distinguish original vs generated).
+    Return None if no match."""
+    qn = _normalize_ws(quote)
+    if not qn:
+        return None
+    try:
+        page_int = int(page) if page is not None and page != "" else None
+    except (TypeError, ValueError):
+        page_int = None
+    for h in hits:
+        if h.get("source") != src:
+            continue
+        # Page may come in as int or str; compare loosely.
+        try:
+            hp = int(h.get("page")) if h.get("page") is not None else None
+        except (TypeError, ValueError):
+            hp = None
+        if page_int is not None and hp != page_int:
+            continue
+        cn = _normalize_ws(h.get("content", ""))
+        if qn in cn:
+            return h.get("chunk_type") or "text"
+    return None
+
+
+# Shared verification + display formatter used by both standard and agent modes.
+# Takes the LLM's claimed `used_passages` and the chunks they should match against;
+# returns a list of display-ready strings (with disclaimer prefix for image-derived quotes)
+# plus a small log-friendly counts tuple.
+def _format_verified_passages(
+    passages_raw: List[Dict],
+    verification_hits: List[Dict],
+    mode_label: str,
+) -> List[str]:
+    verified: List[str] = []
+    kept_original = 0
+    kept_generated = 0
+    dropped_unverified = 0
+    for p in (passages_raw or []):
+        if not isinstance(p, dict):
+            dropped_unverified += 1
+            continue
+        src = p.get("source") or ""
+        page = p.get("page")
+        quote = (p.get("quote") or "").strip()
+        if not (src and quote):
+            dropped_unverified += 1
+            continue
+        matched_type = _verify_quote(quote, src, page, verification_hits)
+        if matched_type is None:
+            dropped_unverified += 1
+            print(
+                f"[WARN] {mode_label}: used_passage dropped (quote not found verbatim in {src} p.{page}): "
+                f"{quote[:80]}{'…' if len(quote) > 80 else ''}"
+            )
+            continue
+        if matched_type == "image":
+            verified.append(
+                f"[AI-generated description of image on {src} p.{page} — for the actual diagram, view {src} p.{page} directly]\n"
+                f"{quote}"
+            )
+            kept_generated += 1
+        else:
+            verified.append(f"[{src} p.{page}] {quote}")
+            kept_original += 1
+
+    if kept_original or kept_generated or dropped_unverified:
+        print(
+            f"[INFO] {mode_label}: kept {len(verified)} passage(s) "
+            f"({kept_original} original_text + {kept_generated} generated_description), "
+            f"dropped {dropped_unverified} unverified"
+        )
+    return verified
+
+
+# Build the standard-mode prompt — JSON-object mode. The model returns:
+#   { "answer": "<prose with inline citations>",
+#     "used_passages": [ {"source": "...", "page": <int>, "quote": "<verbatim text>"}, ... ] }
+# We then substring-verify each quote against the original chunks; unverified ones are dropped
+# (the LLM cannot smuggle in paraphrased "quotes" past the verifier).
 def _build_standard_prompt(query: str, llm_blocks: List[str]) -> str:
     excerpts_text = "\n\n---\n\n".join(llm_blocks)
     return (
@@ -297,6 +431,18 @@ def _build_standard_prompt(query: str, llm_blocks: List[str]) -> str:
         "or diagram on that page. When the user asks about a figure (by number, caption, "
         "or topic), use these excerpts to describe what the figure shows — its components, "
         "structure, labels, and relationships. Cite them like any other excerpt.\n\n"
+        "Each excerpt has a SOURCE_TYPE field with one of two values:\n"
+        "- \"original_text\": text extracted directly from the PDF (paragraphs, tables, "
+        "key-value pairs). Verbatim PDF content.\n"
+        "- \"generated_description\": an AI-generated description of a figure or diagram "
+        "(produced by an image-analysis model). The description is ABOUT the PDF but is "
+        "NOT itself in the PDF.\n"
+        "Both types are equally valid for composing your `answer` AND for inclusion in "
+        "`used_passages`. The downstream UI will label generated_description quotes with a "
+        "clear disclaimer (\"AI-generated description — view the actual image on page X to "
+        "verify\"), so the user can tell them apart. Use whichever excerpts genuinely support "
+        "your claims; never refuse to answer just because the only relevant excerpts are "
+        "generated_description.\n\n"
         "Some excerpts may be marked as \"CONTEXT BLOCK\" — these are adjacent chunks "
         "included alongside a table excerpt, an image excerpt, or a text excerpt that "
         "references a figure or table by number. Use them to interpret column headers, "
@@ -307,23 +453,40 @@ def _build_standard_prompt(query: str, llm_blocks: List[str]) -> str:
         f"{excerpts_text}\n\n"
         "=== USER QUESTION ===\n"
         f"{query}\n\n"
-        "=== RESPONSE REQUIREMENTS ===\n"
+        "=== OUTPUT FORMAT ===\n"
+        "Return a single JSON object with EXACTLY these two fields and nothing else:\n\n"
+        "{\n"
+        "  \"answer\": \"<your prose answer with inline (Source: <file>, page <N>) citations>\",\n"
+        "  \"used_passages\": [\n"
+        "    {\"source\": \"<filename>\", \"page\": <integer>, \"quote\": \"<exact verbatim text from that excerpt>\"}\n"
+        "  ]\n"
+        "}\n\n"
+        "=== RULES FOR `answer` ===\n"
         "1. GROUNDING: Use ONLY the information in the excerpts above. Do not use outside knowledge.\n"
-        "2. INSUFFICIENT EVIDENCE: Only respond with \"I cannot find sufficient evidence "
-        "in the provided documents to answer this question.\" if NONE of the excerpts "
-        "contain content relevant to the user's input. If at least one excerpt is on-topic "
-        "(including an [IMAGE on page N - …] description of the figure being asked about), "
-        "give the best answer you can from the excerpts. Do not speculate or fabricate "
-        "beyond what the excerpts state.\n"
-        "3. CITATION: Every factual claim MUST be followed by a citation in this exact format:\n"
-        "   (Source: <SOURCE_DOCUMENT>, page <PAGE_NUMBER>)\n"
-        "   Example: \"Passwords must be rotated every 90 days (Source: Security_Policy.pdf, page 6).\"\n"
-        "4. QUOTED SUPPORT: After your answer, add a \"Supporting passages:\" section that quotes "
-        "the exact sentence(s) from the excerpts that support your answer, each followed by its "
-        "source and page. Keep each quote under 25 words.\n"
-        "5. MULTI-DOCUMENT: If the answer involves multiple documents (e.g. a comparison), "
-        "clearly attribute each point to its source document.\n"
-        "6. FORMAT: Write the answer as a natural-language paragraph, then the supporting passages list.\n"
+        "2. INSUFFICIENT EVIDENCE: Set `answer` to exactly \"I cannot find sufficient evidence "
+        "in the provided documents to answer this question.\" ONLY if NONE of the excerpts "
+        "contain content relevant to the user's input. If at least one excerpt is on-topic — "
+        "INCLUDING any `generated_description` excerpt about the figure being asked about — "
+        "give the best answer you can. The absence of `original_text` quotes is NEVER a reason "
+        "to refuse: a substantive answer with `used_passages: []` is preferable to refusal.\n"
+        "3. CITATION: Every factual claim in `answer` MUST be followed by an inline citation in this exact format: (Source: <SOURCE_DOCUMENT>, page <PAGE_NUMBER>).\n"
+        "4. MULTI-DOCUMENT: If the answer involves multiple documents, clearly attribute each point to its source document.\n\n"
+        "=== RULES FOR `used_passages` ===\n"
+        "5. EXACT VERBATIM: Each `quote` MUST be copy-pasted character-for-character from one "
+        "of the excerpts above. Do NOT paraphrase, summarize, shorten, fix typos, or reformat. "
+        "Do NOT use ellipsis (`...` or `…`) inside a quote.\n"
+        "6. SOURCE & PAGE MATCH: For every passage, `source` and `page` MUST exactly match the "
+        "SOURCE_DOCUMENT and PAGE_NUMBER of the excerpt the quote was taken from. `page` must be an integer.\n"
+        "7. EITHER SOURCE_TYPE OK: Quotes may come from `original_text` OR `generated_description` "
+        "excerpts. The display layer labels each kind appropriately for the user.\n"
+        "8. ONLY USED: Include only quotes that DIRECTLY support a specific claim you made in `answer`. "
+        "Do NOT include quotes from excerpts you didn't actually rely on. Quality over quantity — "
+        "1 to 5 well-chosen quotes is normal; 10+ usually means you're dumping irrelevant excerpts.\n"
+        "9. FULL UNIT: A quote should be a complete sentence (or a complete table row, or a complete "
+        "bullet point). If you can't include a complete unit verbatim, omit the passage.\n"
+        "10. EMPTY OK: Return `used_passages: []` only when no excerpt actually supports your claims "
+        "verbatim — for example, when your `answer` is the insufficient-evidence message. Otherwise, "
+        "include at least one quote.\n"
     )
 
 
@@ -343,11 +506,21 @@ def _run_agent_mode(query: str, k: int, trace_id: Optional[str], cfg: dict,
     # Callback the agent uses to re-query the index on its own during iterative search.
     # When the index supports `seq`, we also expand table neighbors here so the agent's
     # evidence (and final answer) include context around cross-page table fragments.
-    def search_func(query_text: str, top_k_val: int) -> List[Dict]:
+    #
+    # `exclude_keys`, when provided, is a set of (source, chunk_id) tuples of already-seen
+    # chunks. We oversample 4x from Azure and filter client-side, so the returned `top_k_val`
+    # chunks are guaranteed to be NEW. Without this, repeated searches with rephrased queries
+    # would keep returning the same BM25/vector winners, wasting the top-k budget on duplicates
+    # the agent already has — and masking the "corpus exhausted" signal that should trigger a
+    # stop-early instead of yet another rewrite.
+    def search_func(query_text: str, top_k_val: int,
+                    exclude_keys: Optional[set] = None) -> List[Dict]:
         query_vec = embed_text(aoai, embedding_model, [query_text])[0]
         select_fields = "content,source,page,chunk_id,chunk_type"
         if supports_seq:
             select_fields += ",seq"
+
+        fetch_k = top_k_val * 4 if exclude_keys else top_k_val
         search_payload = {
             "search": query_text or "",
             "queryType": "semantic",
@@ -356,10 +529,10 @@ def _run_agent_mode(query: str, k: int, trace_id: Optional[str], cfg: dict,
                 "kind": "vector",
                 "vector": query_vec,
                 "fields": VECTOR_FIELD,
-                "k": top_k_val
+                "k": fetch_k
             }],
             "select": select_fields,
-            "top": max(1, top_k_val),
+            "top": max(1, fetch_k),
             "count": True
         }
 
@@ -367,9 +540,26 @@ def _run_agent_mode(query: str, k: int, trace_id: Optional[str], cfg: dict,
         if search_response.status_code != 200:
             return []
         raw_hits = search_response.json().get("value", [])
+
+        if exclude_keys:
+            raw_hits = [
+                h for h in raw_hits
+                if (h.get("source"), h.get("chunk_id")) not in exclude_keys
+            ]
+        raw_hits = raw_hits[:top_k_val]
+
         if supports_seq:
             return _expand_neighbors(raw_hits, search_url, headers)
         return raw_hits
+
+    # Section-traversal callback: only meaningful on indexes that have `seq`. The agent uses this
+    # to walk a section forward/backward by seq once it has located the heading chunk via
+    # search_func. None on legacy indexes — the agent's fetch_section tool is then disabled.
+    fetch_by_seq_func = None
+    if supports_seq:
+        def fetch_by_seq_func(source: str, start_seq: int, direction: str = "next",
+                              window: int = 12) -> List[Dict]:
+            return _fetch_by_seq(search_url, headers, source, start_seq, direction, window)
 
     try:
         agent_result = run_pdf_agent(
@@ -379,22 +569,28 @@ def _run_agent_mode(query: str, k: int, trace_id: Optional[str], cfg: dict,
             deployment_name=cfg["openai_deployment"],
             top_k=k,
             min_score=0.85,
-            trace_callback=log_trace
+            trace_callback=log_trace,
+            fetch_by_seq_func=fetch_by_seq_func,
         )
 
         answer = agent_result.final_answer
         agent_trace = agent_result.agent_trace
 
-        # Override contexts with the evidence the agent actually used (may differ from initial retrieval)
-        if agent_result.evidence_used:
-            contexts = []
-            for ev in agent_result.evidence_used:
-                src = ev.get("source", "")
-                page = ev.get("page", "")
-                cid = ev.get("chunk_id", "")
-                content = ev.get("content", "")
-                prefix = f"[{src} p.{page} #{cid}] " if src else ""
-                contexts.append(prefix + content)
+        # Replace `contexts` with the verified verbatim quotes the agent's answer-generation
+        # step claimed to use. Same display rules as standard mode: original-text quotes show
+        # plainly; image-chunk quotes show with the AI-generated disclaimer; unverified
+        # (hallucinated) quotes are dropped. Verification corpus is the agent's full session
+        # (state.all_hits, surfaced as `verification_pool`) so quotes from any chunk the agent
+        # ever saw can match — not just the post-filter `evidence_used` subset.
+        verified = _format_verified_passages(
+            getattr(agent_result, "used_passages", []) or [],
+            getattr(agent_result, "verification_pool", []) or [],
+            mode_label="agent-mode",
+        )
+        if verified:
+            contexts = verified
+        else:
+            contexts = ["(No exact-quote evidence — the model either could not find sufficient grounding, or produced quotes that did not match the retrieved chunks verbatim.)"]
 
     except Exception as e:
         log_trace(f"\n⚠️ Agent error: {str(e)}")
@@ -405,23 +601,43 @@ def _run_agent_mode(query: str, k: int, trace_id: Optional[str], cfg: dict,
     return answer, agent_trace, contexts
 
 
-# Standard mode: one-shot RAG, hard-gate on evidence quality, then call the LLM
-def _run_standard_mode(query: str, filtered_hits: List[Dict], llm_blocks: List[str],
-                       cfg: dict, aoai: AzureOpenAI) -> str:
-    # If no hits passed the relevance threshold, return a default message instead of calling the LLM
+# Standard mode: one-shot RAG with JSON-mode response. Returns (answer_text, verified_quotes).
+# `verified_quotes` is a list of pre-formatted strings ready for the UI's "Retrieved" panel,
+# OR None if JSON parsing failed (caller should fall back to the raw retrieved chunks).
+def _run_standard_mode(query: str, filtered_hits: List[Dict], all_hits_for_verify: List[Dict],
+                       llm_blocks: List[str], cfg: dict,
+                       aoai: AzureOpenAI) -> Tuple[str, Optional[List[str]]]:
+    # If no hits passed the relevance threshold, skip the LLM call entirely.
     if not filtered_hits:
-        return (
+        msg = (
             "I cannot find sufficient evidence in the provided documents to answer this question. "
             f"No retrieved passages met the minimum relevance threshold "
             f"(reranker score >= {MIN_RERANKER_SCORE})."
         )
+        return msg, []
 
     prompt = _build_standard_prompt(query, llm_blocks)
     completion = aoai.chat.completions.create(
         model=cfg["openai_deployment"],
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
     )
-    return completion.choices[0].message.content
+    raw = completion.choices[0].message.content or ""
+
+    # Parse the JSON. If parsing fails, return raw text + None so the caller falls back.
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"[WARN] standard-mode JSON parse failed: {e}; falling back to raw text")
+        return raw, None
+
+    answer = (data.get("answer") or "").strip()
+    passages_raw = data.get("used_passages") or []
+    if not isinstance(passages_raw, list):
+        passages_raw = []
+
+    verified = _format_verified_passages(passages_raw, all_hits_for_verify, mode_label="standard-mode")
+    return answer, verified
 
 
 # Main entry point: orchestrates retrieval, filtering, answer generation, and citation packaging
@@ -483,7 +699,18 @@ def process_pdf_query(index_name: str, query: str, top_k: int,
             supports_seq=supports_seq
         )
     else:
-        answer = _run_standard_mode(query, filtered_hits, llm_blocks, cfg, aoai)
+        # Standard mode: ask the LLM for JSON with answer + the exact verbatim passages it used,
+        # verify each quote against the original chunks, and replace the user-visible retrieved
+        # context with just those verified quotes — clean, no noise from unused chunks.
+        answer, verified_quotes = _run_standard_mode(
+            query, filtered_hits, expanded_hits, llm_blocks, cfg, aoai
+        )
+        if verified_quotes is not None:
+            if verified_quotes:
+                contexts = verified_quotes
+            else:
+                contexts = ["(No exact-quote evidence — the model either could not find sufficient grounding, or produced quotes that did not match the retrieved chunks verbatim.)"]
+        # else: JSON parsing failed; keep the original full-chunk contexts as a fallback
 
     # Step 5: build structured citations list for the frontend (source + page + score + content)
     citations = []
